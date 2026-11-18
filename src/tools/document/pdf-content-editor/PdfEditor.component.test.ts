@@ -123,6 +123,37 @@ it("创建文字阻止鼠标默认焦点转移，并保持文字工具，完成�
   expect(root.querySelector(".text-object")?.textContent).toBe("可以继续输入中文");
 });
 
+it("格式刷可复制原文格式并应用到另一段原文，保留文字和位置且可撤销重做", async () => {
+  textBackend.read.mockResolvedValue([
+    { id: "0:0:0", page: 0, text: "AAAA", x: 40, y: 50, width: 100, height: 32, fontSize: 24, color: "#b5412f", supported: true },
+    { id: "0:1:0", page: 0, text: "AA", x: 140, y: 150, width: 50, height: 20, fontSize: 14, color: "#141413", supported: true },
+  ]);
+  const root = await mount();
+  await vi.waitFor(() => expect(root.querySelectorAll(".original-text-target")).toHaveLength(2));
+  const [source, target] = root.querySelectorAll(".original-text-target");
+  button(root, "格式刷").click();
+  await nextTick();
+  pointer(source, "pointerdown", 45, 55);
+  await vi.waitFor(() => expect(root.querySelector('[role="status"]')?.textContent).toContain("点击要应用格式的文字"));
+  expect(root.querySelector(".edit-object")).toBeNull();
+  expect(textBackend.remove).not.toHaveBeenCalled();
+
+  pointer(target, "pointerdown", 145, 155);
+  await vi.waitFor(() => expect(textBackend.remove).toHaveBeenCalledWith(["0:1:0"]));
+  expect(button(root, "格式刷").getAttribute("aria-pressed")).toBe("false");
+  expect(root.querySelector(".inline-text")).toBeNull();
+  root.querySelector<HTMLButtonElement>('button[title="撤销（Ctrl+Z）"]')!.click();
+  await nextTick();
+  expect(root.querySelectorAll(".original-text-target")).toHaveLength(2);
+  root.querySelector<HTMLButtonElement>('button[title="重做（Ctrl+Shift+Z）"]')!.click();
+  await nextTick();
+  button(root, "导出 PDF").click();
+  await vi.waitFor(() => expect(exportEditedPdf).toHaveBeenCalled());
+  expect(vi.mocked(exportEditedPdf).mock.calls[0][2]).toEqual([
+    expect.objectContaining({ text: "AA", originalId: "0:1:0", x: 140, y: 150, fontSize: 24, color: "#b5412f" }),
+  ]);
+});
+
 it("修改原文时先移除旧文字，导出替换内容；撤销可恢复原文", async () => {
   const root = await mount();
   await vi.waitFor(() => expect(root.querySelector(".original-text-target")).not.toBeNull());

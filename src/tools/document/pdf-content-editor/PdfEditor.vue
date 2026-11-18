@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowUpRight, Circle, FilePenLine, Highlighter, ImagePlus, Move, LoaderCircle, MousePointer2, PenLine, Redo2, Save, Square, Trash2, Type, Undo2, X, ZoomIn, ZoomOut, Minus, SlidersHorizontal, Upload } from "lucide-vue-next";
+import { ArrowUpRight, Circle, FilePenLine, Highlighter, ImagePlus, Move, LoaderCircle, MousePointer2, PaintRoller, PenLine, Redo2, Save, Square, Trash2, Type, Undo2, X, ZoomIn, ZoomOut, Minus, SlidersHorizontal, Upload } from "lucide-vue-next";
 import FileDropZone from "@/components/common/FileDropZone.vue";
 import AppSelect from "@/components/common/AppSelect.vue";
 import { useWindowEvent } from "@/composables/useWindowEvent";
@@ -14,6 +14,7 @@ import { readPdfOutline, resolveOutlinePage, type PdfOutlineEntry } from "./pdfO
 import { createPdfTextClient } from "./pdfTextClient";
 import type { OriginalPdfText } from "./pdfTextTypes";
 import { exportEditedPdf } from "./pdfEditor";
+import { copyTextFormat, type PdfTextFormat } from "./pdfFormatPainter";
 import { arrowHeadPoints, arrowHeadSize, clampObject, cloneEditObjects, createEditHistory, originalState, pristineOriginal, textLines, type EditKind, type EditPoint, type PdfEditObject, type PdfEditPage } from "./pdfEditorModel";
 import { usePdfEditorFonts } from "./usePdfEditorFonts";
 import { usePdfPagePreview, type PdfEditorSource } from "./usePdfPagePreview";
@@ -24,7 +25,8 @@ const pages = ref<PdfEditPage[]>([]);
 const pageIndex = ref(0);
 const zoom = ref(1);
 const loading = ref(false), exporting = ref(false);
-const mode = ref<"select" | "original" | EditKind>("select");
+const mode = ref<"select" | "original" | "formatPainter" | EditKind>("select");
+const formatPainter = shallowRef<{ format?: PdfTextFormat }>();
 const objects = ref<PdfEditObject[]>([]);
 const selectedId = ref<number>();
 const selected = computed(() => objects.value.find((item) => item.id === selectedId.value));
@@ -164,6 +166,42 @@ const textWidth = (item: PdfEditObject) => {
   return Math.max(0, ...textLines((item.text || "").replace(/\t/g, "    ")).map((line) =>
     (font?.measure(line, size) ?? 0) + [...line].length * (item.characterSpacing || 0)));
 };
+const paintText = (item: PdfEditObject) => {
+  const painter = formatPainter.value;
+  if (!painter || item.kind !== "text" || !item.text?.trim()) return;
+  if (!painter.format) {
+    formatPainter.value = { format: copyTextFormat(item) };
+    return;
+  }
+  const formatted = { ...item, ...painter.format };
+  const font = fonts.value.find((candidate) => candidate.id === (formatted.fontId || "default"));
+  if (!font || [...item.text].some((char) => !/\s/.test(char) && !font.characters.has(char.codePointAt(0)!))) {
+    showError(t("document.pdfEditUnsupportedText"));
+    return;
+  }
+  const page = pages.value[item.page];
+  const lines = textLines(item.text.replace(/\t/g, "    "));
+  const size = formatted.fontSize || 18;
+  const spacing = formatted.characterSpacing || 0;
+  const width = (formatted.textOriginX || 0) + Math.max(...lines.map((line) =>
+    font.measure(line, size) + Math.max(0, [...line].length - 1) * spacing,
+  )) * (formatted.horizontalScale || 1);
+  const height = lines.length * (formatted.lineHeight || size * 1.25);
+  if (width > page.width - item.x + 0.1 || height > page.height - item.y + 0.1) {
+    showError(t("document.pdfEditTextOverflow"));
+    return;
+  }
+  if (JSON.stringify(copyTextFormat(item)) !== JSON.stringify(painter.format)) {
+    commitHistory();
+    formatted.width = Math.min(page.width - item.x, Math.max(item.width, width + 2));
+    formatted.height = Math.min(page.height - item.y, Math.max(item.height, height));
+    if (objects.value.includes(item)) Object.assign(item, formatted);
+    else objects.value.push(formatted);
+    selectedId.value = item.id;
+  }
+  formatPainter.value = undefined;
+  mode.value = "select";
+};
 const growText = (item: PdfEditObject, event: Event) => {
   const textarea = event.target as HTMLTextAreaElement;
   const page = pages.value[item.page], size = item.fontSize || 18, scale = item.horizontalScale || 1;
@@ -273,6 +311,7 @@ const reset = () => {
   pageElements.clear(); stage.value = undefined; visiblePages.value = [0];
   void source.value?.doc.destroy(); source.value = undefined;
   pages.value = []; objects.value = []; selectedId.value = undefined; pageIndex.value = 0;
+  if (formatPainter.value) { formatPainter.value = undefined; mode.value = "select"; }
   history.clear(); revision.value++; propertySnapshot = undefined;
   editingId.value = undefined; textSnapshot = undefined;
   outline.value = []; navigation.value = "thumbnails";
@@ -347,15 +386,17 @@ const editOriginal = async (run: OriginalPdfText) => {
   if (!run.supported) { showError(t("document.pdfEditUnsupportedOriginal")); return; }
   finishText(); endProperty();
   const snapshot = copyObjects(), generation = token, intentMode = mode.value;
+  const painter = formatPainter.value;
   preparingOriginal.value = true;
   try {
     const matching = run.fontName ? await resolveOriginalFont(run) : undefined;
-    if (generation !== token || disposed || mode.value !== intentMode || pageIndex.value !== run.page) return;
+    if (generation !== token || disposed || mode.value !== intentMode || painter !== formatPainter.value || pageIndex.value !== run.page) return;
     const item = clampObject({ ...fresh("text", { x: run.x, y: run.y }), originalId: run.id, originalFontName: run.fontName, text: run.text, fontId: matching?.id || "default", fontSize: run.fontSize, color: run.color,
       baseline: run.baseline === undefined ? undefined : run.baseline - run.y, lineHeight: run.lineHeight,
       textOriginX: run.originX === undefined ? 0 : run.originX - run.x, characterSpacing: run.characterSpacing, horizontalScale: run.horizontalScale,
       width: Math.min(metadata.value.width - run.x, Math.max(run.width + 2, 4)), height: Math.max(run.height, run.text.split("\n").length * (run.lineHeight || run.fontSize * 1.25)) }, metadata.value);
     item.originalState = originalState(item);
+    if (painter) { paintText(item); return; }
     objects.value.push(item);
     await editText(item, snapshot);
   } catch (error) { if (generation === token && !disposed) showError(error); }
@@ -366,6 +407,7 @@ const tools = computed(() => [
   { id: "select", icon: MousePointer2 }, { id: "text", icon: Type }, { id: "original", icon: FilePenLine }, { id: "image", icon: ImagePlus },
   { id: "signature", icon: PenLine }, { id: "highlight", icon: Highlighter }, { id: "rectangle", icon: Square },
   { id: "ellipse", icon: Circle }, { id: "line", icon: Minus }, { id: "arrow", icon: ArrowUpRight },
+  { id: "formatPainter", icon: PaintRoller },
 ] as const);
 // 在 Vue 更新选中状态之前记录旧位置，使用公共滑动高亮。
 watch(mode, async () => {
@@ -380,7 +422,17 @@ const showTextControls = computed(() => selected.value ? selected.value.kind ===
 const showStrokeControls = computed(() => ["signature", "rectangle", "ellipse", "line", "arrow"].includes(selected.value?.kind ?? mode.value));
 const propertyTool = computed(() => tools.value.find((tool) => tool.id === (selected.value?.originalId ? "original" : selected.value?.kind ?? mode.value)) ?? tools.value[0]);
 const chooseMode = (tool: typeof mode.value) => {
+  if (tool === "formatPainter") {
+    const text = selected.value;
+    finishText(); endProperty();
+    const format = text?.kind === "text" && text.text?.trim() ? copyTextFormat(text) : undefined;
+    formatPainter.value = formatPainter.value ? undefined : { format };
+    mode.value = formatPainter.value ? "formatPainter" : "select";
+    selectedId.value = undefined;
+    return;
+  }
   finishText(); endProperty();
+  if (formatPainter.value) { formatPainter.value = undefined; mode.value = "select"; }
   if (tool === "image") { imageInput.value?.click(); return; }
   mode.value = tool; selectedId.value = undefined;
 };
@@ -415,6 +467,11 @@ const pointAt = (event: PointerEvent): EditPoint => {
 };
 const begin = (event: PointerEvent, item?: PdfEditObject, resize = false, forceMove = false) => {
   if (event.button !== 0 || (rendering.value && !pageUrl.value) || exporting.value || !metadata.value) return;
+  if (mode.value === "formatPainter") {
+    event.preventDefault();
+    if (item && !preparingOriginal.value && !removingOriginal.value) paintText(item);
+    return;
+  }
   // 拖动或缩放未修改原文时保留临时对象，不能在失焦处理中提前删除。
   finishText(item && (forceMove || resize || mode.value === "select") ? item : undefined); endProperty();
   const point = pointAt(event), snapshot = copyObjects();
@@ -500,7 +557,7 @@ useWindowEvent("keydown", (event) => {
   else if (!input && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); }
   else if (!input && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") { event.preventDefault(); redo(); }
   else if (!input && (event.key === "Delete" || event.key === "Backspace")) { event.preventDefault(); remove(); }
-  else if (event.key === "Escape") { finishText(); mode.value = "select"; selectedId.value = undefined; }
+  else if (event.key === "Escape") { finishText(); formatPainter.value = undefined; mode.value = "select"; selectedId.value = undefined; }
 });
 onBeforeUnmount(() => {
   disposed = true; reset();
@@ -542,7 +599,8 @@ onBeforeUnmount(() => {
                 <button class="btn subtle small import-font" :title="t('document.pdfEditImportFont')" @click="fontInput?.click()"><Upload :size="14" />{{ t("document.pdfEditImportFontShort") }}</button>
               </div>
             </Transition>
-            <div v-if="selected || mode !== 'select'" class="property-group appearance-properties">
+            <p v-if="mode === 'formatPainter'" class="selection-hint" role="status">{{ t(formatPainter?.format ? 'document.pdfEditPainterTarget' : 'document.pdfEditPainterSource') }}</p>
+            <div v-if="selected || (mode !== 'select' && mode !== 'formatPainter')" class="property-group appearance-properties">
               <label v-if="selected?.kind !== 'image'" class="color-property"><span>{{ t("document.pdfEditColor") }}</span><input class="color-input" type="color" :value="selected?.color || color" @focus="startProperty" @input="selected ? selected.color = ($event.target as HTMLInputElement).value : color = ($event.target as HTMLInputElement).value" @blur="endProperty" /></label>
               <label v-if="selected" class="opacity-property"><span>{{ t("document.pdfEditOpacity") }}</span><input type="range" min="0.05" max="1" step="0.05" v-model.number="selected.opacity" @focus="startProperty" @pointerdown="startProperty" @change="endProperty" @blur="endProperty" /><output>{{ Math.round(selected.opacity * 100) }}%</output></label>
             </div>
@@ -577,8 +635,8 @@ onBeforeUnmount(() => {
           <div class="page-stack">
           <div v-for="(page, index) in pages" :key="index" class="page-stage" :data-document-page="index" :ref="(element) => setPageElement(element, index)" :class="{ drawing: mode !== 'select', rendering: index === pageIndex && rendering && !pageImages.has(index) }" :style="{ width: `${page.width * zoom}px`, height: `${page.height * zoom}px` }" @pointerdown.self="activatePage($event, index)" @pointermove="move" @pointerup="finish($event)" @pointercancel="finish($event, true)">
             <img v-if="pageImages.get(index)" class="page-background" :src="pageImages.get(index)" alt="" draggable="false" />
-            <template v-if="index === pageIndex && ['select', 'text', 'original'].includes(mode) && !readingOriginal">
-              <button v-for="run in currentOriginalText" :key="run.id" class="original-text-target" :class="{ unsupported: !run.supported }" :style="{ left: `${run.x * zoom}px`, top: `${run.y * zoom}px`, width: `${run.width * zoom}px`, height: `${run.height * zoom}px` }" :title="run.supported ? run.text : t('document.pdfEditUnsupportedOriginal')" :aria-label="run.text" @pointerdown.stop.prevent="editOriginal(run)" />
+            <template v-if="index === pageIndex && ['select', 'text', 'original', 'formatPainter'].includes(mode) && !readingOriginal">
+              <button v-for="run in currentOriginalText" :key="run.id" class="original-text-target" :class="{ unsupported: !run.supported }" :style="{ left: `${run.x * zoom}px`, top: `${run.y * zoom}px`, width: `${run.width * zoom}px`, height: `${run.height * zoom}px` }" :title="run.supported ? run.text : t('document.pdfEditUnsupportedOriginal')" :aria-label="run.text" @pointerdown.stop.prevent="editOriginal(run)" @click="mode === 'formatPainter' && $event.detail === 0 && editOriginal(run)" />
             </template>
             <div v-for="item in objects.filter((object) => object.page === index)" :key="item.id" class="edit-object" :class="{ 'text-kind': item.kind === 'text', selected: item.id === selectedId && ['select', 'text', 'original'].includes(mode) }" :style="objectStyle(item)" @pointerdown.stop="activatePage($event, index, item)" @dblclick.stop="item.kind === 'text' && editText(item)">
               <textarea v-if="item.kind === 'text' && editingId === item.id" v-model="item.text" class="inline-text" wrap="off" :class="{ 'original-pristine': originalStillVisible(item) }" :style="textStyle(item)" :placeholder="t('document.pdfEditTypeHere')" :aria-label="t('document.pdfEditText')" @input="growText(item, $event)" @pointerdown.stop @dblclick.stop @blur="blurText($event)" />
@@ -666,6 +724,7 @@ onBeforeUnmount(() => {
 .property-row { display: flex; align-items: center; flex-wrap: wrap; min-height: 58px; gap: 10px 16px; padding: 10px 16px; }
 .property-context { flex: none; display: flex; align-items: center; gap: 7px; min-width: 88px; padding-right: 16px; border-right: 1px solid var(--border); color: var(--text-2); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .property-mark { color: var(--text-3); margin-left: auto; }
+.selection-hint { margin: 0; color: var(--text-2); font-size: 12px; }
 .property-group { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
 .property-group + .property-group { padding-left: 16px; border-left: 1px solid var(--border); }
 .format-toolbar label { display: flex; flex: none; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
